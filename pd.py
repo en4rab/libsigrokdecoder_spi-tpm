@@ -125,8 +125,8 @@ class Decoder(srd.Decoder):
         ('Read', 'Read register operation'),
         ('Write', 'Write register operation'),
         ('Address', 'Register address'),
-        ('Data', 'Data'),
         ('Wait', 'Wait'),
+        ('Data', 'Data'),
         ('VMK', 'Extracted BitLocker VMK'),
     )
     annotation_rows = (
@@ -143,11 +143,22 @@ class Decoder(srd.Decoder):
         self.end_wait = 0x01
         self.operation_mask = 0x80
         self.address_mask = 0x3f
+
+        # --- Standard VMK (TPM-only) detection state ---
         # Circular buffer to detect VMK header on transaction data
         self.queue = deque(maxlen=12)
         self.vmk_meta = {"s_queue": deque(maxlen=12), "vmk_ss": 0, "vmk_es": 0}
         self.saving_vmk = False
         self.vmk = []
+
+        # --- TPMandPIN VMK detection state ---
+        # Header pattern: 5000000005000000 (8 bytes), followed by 72 bytes of key material
+        self.pin_queue = deque(maxlen=8)
+        self.pin_meta = {"s_queue": deque(maxlen=8)}
+        self.saving_pin_vmk = False
+        self.pin_vmk = []
+        self.pin_vmk_meta = {"vmk_ss": 0, "vmk_es": 0}
+
         self.reset()
         self.state_machine = None
         self.init_state_machine()
@@ -261,7 +272,7 @@ class Decoder(srd.Decoder):
             return False
 
     def check_vmk_header(self):
-        """ Check for VMK header """
+        """ Check for standard TPM-only VMK header (2c000x000x000x000x200000) """
         if self.queue[0] == 0x2c:
             potential_header = ''.join('{:02x}'.format(x) for x in self.queue)
             if re.findall(r'2c000[0-6]000[1-9]000[0-1]000[0-5]200000', potential_header):
@@ -269,31 +280,53 @@ class Decoder(srd.Decoder):
                          [Ann.VMK, ['VMK header: {}'.format(potential_header)]])
                 self.saving_vmk = True
 
+    def check_pin_vmk_header(self):
+        """ Check for TPMandPIN VMK header (5000000005000000) """
+        if self.pin_queue[0] == 0x50:
+            potential_header = ''.join('{:02x}'.format(x) for x in self.pin_queue)
+            if re.findall(r'5000000005000000', potential_header):
+                self.put(self.pin_meta["s_queue"][0], self.es, self.out_ann,
+                         [Ann.VMK, ['TPMandPIN VMK header: {}'.format(potential_header)]])
+                self.saving_pin_vmk = True
+                self.pin_vmk = []
+
     def recover_vmk(self, miso):
-        """ Check if VMK is releasing """
+        """ Check if VMK is being released, handling both TPM-only and TPMandPIN formats. """
+        if not self._is_vmk_transaction():
+            return
+
+        # --- Standard TPM-only VMK pipeline ---
         if not self.saving_vmk:
-            # Add data to the circular buffer
-            # Check if the transaction actually got the VMK.
-            # Sometimes, other TPM transactions occurs when recovering the VMK
-            if self._is_vmk_transaction():
-                self.queue.append(miso)
-                # Add sample number to meta queue
-                self.vmk_meta["s_queue"].append(self.ss)
-                # Check if VMK header retrieved
-                self.check_vmk_header()
+            self.queue.append(miso)
+            self.vmk_meta["s_queue"].append(self.ss)
+            self.check_vmk_header()
         else:
             if len(self.vmk) == 0:
                 self.vmk_meta["vmk_ss"] = self.ss
             if len(self.vmk) < 32:
-                # Check if the transaction actually got the VMK.
-                # Sometimes, other TPM transactions occurs when recovering the VMK
-                if self._is_vmk_transaction():
-                    self.vmk.append(miso)
-                    self.vmk_meta["vmk_es"] = self.es
+                self.vmk.append(miso)
+                self.vmk_meta["vmk_es"] = self.es
             else:
                 self.saving_vmk = False
                 self.put(self.vmk_meta["vmk_ss"], self.vmk_meta["vmk_es"], self.out_ann,
                          [Ann.VMK, ['VMK: {}'.format(''.join('{:02x}'.format(x) for x in self.vmk))]])
+
+        # --- TPMandPIN VMK pipeline ---
+        if not self.saving_pin_vmk:
+            self.pin_queue.append(miso)
+            self.pin_meta["s_queue"].append(self.ss)
+            self.check_pin_vmk_header()
+        else:
+            if len(self.pin_vmk) == 0:
+                self.pin_vmk_meta["vmk_ss"] = self.ss
+            if len(self.pin_vmk) < 72:
+                self.pin_vmk.append(miso)
+                self.pin_vmk_meta["vmk_es"] = self.es
+            else:
+                self.saving_pin_vmk = False
+                self.put(self.pin_vmk_meta["vmk_ss"], self.pin_vmk_meta["vmk_es"], self.out_ann,
+                         [Ann.VMK, ['TPMandPIN VMK: {}'.format(
+                             ''.join('{:02x}'.format(x) for x in self.pin_vmk))]])
 
     def decode(self, ss, es, data):       
         self.ss, self.es = ss, es
